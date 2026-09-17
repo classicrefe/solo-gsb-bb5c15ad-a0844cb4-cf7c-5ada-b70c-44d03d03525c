@@ -107,6 +107,35 @@ class BatchEvalResponse(BaseModel):
     missing_flags: list[str]
 
 
+# ---------------------------------------------------------------------------
+# Version comparison models
+# ---------------------------------------------------------------------------
+
+
+class ConfigComparisonRequest(StrictModel):
+    from_version: str = Field(min_length=1)
+    to_version: str = Field(min_length=1)
+
+
+class ImpactedFlag(BaseModel):
+    flag: str
+    path: list[str]
+
+
+class FlagImpact(BaseModel):
+    flag: str
+    impacted: list[ImpactedFlag]
+
+
+class ConfigComparisonResponse(BaseModel):
+    from_version: str
+    to_version: str
+    added: list[str]
+    removed: list[str]
+    modified: list[str]
+    impacts: list[FlagImpact]
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str

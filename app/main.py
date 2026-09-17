@@ -12,10 +12,13 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import db as db_mod
+from .comparison import compare_versions
 from .evaluator import FlagNotFound, evaluate_flag
 from .schemas import (
     BatchEvalRequest,
     BatchEvalResponse,
+    ConfigComparisonRequest,
+    ConfigComparisonResponse,
     ConfigResponse,
     PublishConfigRequest,
     PublishResponse,
@@ -139,6 +142,47 @@ def get_config(version: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Version comparison (impact analysis)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/v1/config-comparisons", response_model=ConfigComparisonResponse)
+def compare_configs(body: ConfigComparisonRequest) -> Any:
+    conn = db_mod.connect()
+    try:
+        from_row = db_mod.get_version(conn, body.from_version)
+        if from_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "version_not_found",
+                    "message": f"config version {body.from_version!r} not found",
+                },
+            )
+        to_row = db_mod.get_version(conn, body.to_version)
+        if to_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "version_not_found",
+                    "message": f"config version {body.to_version!r} not found",
+                },
+            )
+    finally:
+        conn.close()
+
+    analysis = compare_versions(
+        from_row["config"].get("flags", {}),
+        to_row["config"].get("flags", {}),
+    )
+    return ConfigComparisonResponse(
+        from_version=body.from_version,
+        to_version=body.to_version,
+        **analysis,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -201,6 +245,7 @@ def root() -> dict[str, Any]:
             "POST /api/v1/configs",
             "GET /api/v1/configs",
             "GET /api/v1/configs/{version}",
+            "POST /api/v1/config-comparisons",
             "POST /api/v1/evaluate",
         ],
     }

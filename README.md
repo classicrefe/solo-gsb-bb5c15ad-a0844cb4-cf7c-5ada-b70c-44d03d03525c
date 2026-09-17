@@ -8,6 +8,7 @@
 - 🔗 **前置开关**：开关可声明 `prerequisites`（含期望值 `expect`），按依赖深度优先、短路求值，响应返回完整**依赖链**。
 - 📋 **有序规则**：`rules` 按顺序匹配、首条命中即返回，支持 `eq/ne/in/nin/gt/ge/lt/le/prefix/suffix`。
 - 🎯 **稳定百分比分流**：`sha1(flag_key:user_id) % 100`，同一用户在同一开关上桶位恒定，放量单调扩大；不同开关独立分布。
+- 🔀 **版本影响分析**：对比任意两个已发布版本，给出开关级 `added/removed/modified` 差异，并沿两版本前置依赖边的并集反向传播，列出每个变化开关间接影响的上游开关及一条最短路径。
 - 🚫 **发布时强校验**：循环依赖（含自依赖）、悬挂依赖、非法比例（非整数或越界）、未知操作符、重复规则 ID 一律拒绝。
 - 🧪 **纯函数引擎**：判定引擎与校验器零第三方依赖，可直接用系统 Python 跑单测。
 
@@ -124,6 +125,45 @@ curl -s http://localhost:8000/api/v1/configs                       # 列出全�
 curl -s http://localhost:8000/api/v1/configs/2026-09-17            # 读取某版本完整配置
 ```
 
+### 6. 版本影响分析（对比两个版本）
+
+```bash
+# 再发布一个修改了前置开关 signed_in 的版本（新增 staff-bypass 规则）
+curl -s -X POST http://localhost:8000/api/v1/configs \
+  -H 'Content-Type: application/json' --data @examples/publish_v3.json
+
+# 对比 2026-09-18 → 2026-09-19
+curl -s -X POST http://localhost:8000/api/v1/config-comparisons \
+  -H 'Content-Type: application/json' --data @examples/compare_request.json
+```
+
+响应：
+
+```json
+{
+  "from_version": "2026-09-18",
+  "to_version": "2026-09-19",
+  "added": [],
+  "removed": [],
+  "modified": ["signed_in"],
+  "impacts": [
+    {
+      "flag": "signed_in",
+      "impacted": [
+        { "flag": "new_checkout", "path": ["signed_in", "new_checkout"] }
+      ]
+    }
+  ]
+}
+```
+
+说明：
+
+- `added` / `removed` / `modified`：按开关名比较两个版本的**规范化定义**（与存储一致的规范化结构比较，键序差异不算修改）；
+- `impacts`：在**两个版本前置依赖边的并集**上沿反向依赖传播，逐个列出每个直接变化开关间接影响的上游开关；`path` 是从变化开关到依赖者的一条**最短路径**（同长取字典序最小）；
+- 所有名称与路径均按字典序稳定排序，同一受影响开关只出现一次；没有受影响下游的变化开关也会列出（`impacted` 为空）；
+- 任一版本不存在返回 `404 version_not_found`。
+
 ### 非法配置会被拒绝
 
 ```bash
@@ -194,6 +234,7 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
 | `POST` | `/api/v1/configs` | 发布一个新版本（语义校验失败返回 422；版本重复返回 409） |
 | `GET` | `/api/v1/configs` | 列出所有版本 |
 | `GET` | `/api/v1/configs/{version}` | 获取某版本完整配置（不存在返回 404） |
+| `POST` | `/api/v1/config-comparisons` | 版本影响分析，请求体 `{from_version, to_version}`，返回开关差异与反向依赖影响（任一版本不存在返回 404） |
 | `POST` | `/api/v1/evaluate` | 批量判定，请求体 `{version, flags[], user_id?, attributes?}` |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -217,7 +258,7 @@ FLAG_DB_PATH=data/flags.db uvicorn app.main:app --reload --port 8000
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、SQLite 版本不可变与历史保留、固定版本重复判定稳定性。
+测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、SQLite 版本不可变与历史保留、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）。
 
 ## 项目结构
 
@@ -228,7 +269,8 @@ app/
   db.py          SQLite 不可变版本存储（WAL）
   validation.py  发布时语义校验（循环依赖/比例/操作符等）
   evaluator.py   纯函数判定引擎（前置、规则、稳定哈希分流）
+  comparison.py  版本对比与反向依赖影响分析（纯函数）
 tests/           标准库 unittest 测试
-examples/        发布/判定/非法配置示例
+examples/        发布/判定/版本对比/非法配置示例
 Dockerfile, docker-compose.yml
 ```

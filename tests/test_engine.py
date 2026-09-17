@@ -11,6 +11,12 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db as db_mod  # noqa: E402
+from app.comparison import (  # noqa: E402
+    build_reverse_graph,
+    compare_versions,
+    diff_flags,
+    impact_analysis,
+)
 from app.evaluator import evaluate_flag, hash_bucket  # noqa: E402
 from app.validation import ConfigValidationError, validate_config  # noqa: E402
 
@@ -330,6 +336,110 @@ class ValidationTests(unittest.TestCase):
 
     def test_empty_config_is_valid(self):
         validate_config({"flags": {}})
+
+
+class VersionComparisonTests(unittest.TestCase):
+    def test_diff_added_removed_modified_sorted(self):
+        old = {
+            "keep": flag(default=1),
+            "mod": flag(default="a"),
+            "gone_b": flag(),
+            "gone_a": flag(),
+        }
+        new = {
+            "keep": flag(default=1),
+            "mod": flag(default="b"),
+            "new_b": flag(),
+            "new_a": flag(),
+        }
+        added, removed, modified = diff_flags(old, new)
+        self.assertEqual(added, ["new_a", "new_b"])
+        self.assertEqual(removed, ["gone_a", "gone_b"])
+        self.assertEqual(modified, ["mod"])
+
+    def test_key_order_is_not_a_modification(self):
+        a = {"f": {"enabled": True, "default": False, "rules": []}}
+        b = {"f": {"default": False, "rules": [], "enabled": True}}
+        self.assertEqual(diff_flags(a, b), ([], [], []))
+
+    def test_chain_impact_reports_shortest_paths(self):
+        flags = {
+            "a": flag(),
+            "b": flag(prerequisites=[{"flag": "a"}]),
+            "c": flag(prerequisites=[{"flag": "b"}]),
+        }
+        adj = build_reverse_graph(flags)
+        impacts = impact_analysis(["a"], adj)
+        self.assertEqual([i["flag"] for i in impacts], ["a"])
+        impacted = impacts[0]["impacted"]
+        self.assertEqual([i["flag"] for i in impacted], ["b", "c"])
+        self.assertEqual(impacted[0]["path"], ["a", "b"])
+        self.assertEqual(impacted[1]["path"], ["a", "b", "c"])
+
+    def test_diamond_prefers_direct_shortest_path(self):
+        flags = {
+            "a": flag(),
+            "b": flag(prerequisites=[{"flag": "a"}]),
+            "c": flag(prerequisites=[{"flag": "a"}, {"flag": "b"}]),
+        }
+        adj = build_reverse_graph(flags)
+        impacts = impact_analysis(["a"], adj)
+        paths = {i["flag"]: i["path"] for i in impacts[0]["impacted"]}
+        self.assertEqual(paths["b"], ["a", "b"])
+        self.assertEqual(paths["c"], ["a", "c"])
+
+    def test_equal_length_paths_pick_lexicographically_smallest(self):
+        flags = {
+            "x": flag(),
+            "q": flag(prerequisites=[{"flag": "x"}]),
+            "p": flag(prerequisites=[{"flag": "x"}]),
+            "z": flag(prerequisites=[{"flag": "p"}, {"flag": "q"}]),
+        }
+        adj = build_reverse_graph(flags)
+        impacts = impact_analysis(["x"], adj)
+        paths = {i["flag"]: i["path"] for i in impacts[0]["impacted"]}
+        self.assertEqual(paths["z"], ["x", "p", "z"])
+
+    def test_impact_uses_union_of_edges_from_both_versions(self):
+        old = {"a": flag(), "b": flag(prerequisites=[{"flag": "a"}])}
+        new = {"a": flag(default="changed"), "b": flag()}  # edge removed in new
+        result = compare_versions(old, new)
+        self.assertEqual(result["modified"], ["a", "b"])
+        impacts = {i["flag"]: i for i in result["impacts"]}
+        # The edge b->a only exists in the old version, yet b is still
+        # reported as impacted by the change in a.
+        self.assertEqual([x["flag"] for x in impacts["a"]["impacted"]], ["b"])
+
+    def test_union_cycle_tolerated_and_source_not_self_impacted(self):
+        old = {"a": flag(prerequisites=[{"flag": "b"}]), "b": flag()}
+        new = {"a": flag(), "b": flag(prerequisites=[{"flag": "a"}])}
+        result = compare_versions(old, new)
+        self.assertEqual(result["modified"], ["a", "b"])
+        impacts = {i["flag"]: i for i in result["impacts"]}
+        self.assertEqual([x["flag"] for x in impacts["a"]["impacted"]], ["b"])
+        self.assertEqual([x["flag"] for x in impacts["b"]["impacted"]], ["a"])
+
+    def test_duplicate_impacts_reported_once(self):
+        flags = {
+            "a": flag(),
+            "b": flag(prerequisites=[{"flag": "a"}]),
+            "c": flag(prerequisites=[{"flag": "a"}, {"flag": "b"}]),
+            "d": flag(prerequisites=[{"flag": "c"}]),
+        }
+        adj = build_reverse_graph(flags)
+        impacts = impact_analysis(["a"], adj)
+        names = [i["flag"] for i in impacts[0]["impacted"]]
+        self.assertEqual(names, ["b", "c", "d"])
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_changed_flag_without_dependents_has_empty_impacted(self):
+        result = compare_versions({}, {"solo": flag()})
+        self.assertEqual(result["added"], ["solo"])
+        self.assertEqual(result["impacts"], [{"flag": "solo", "impacted": []}])
+
+    def test_impacts_sorted_by_changed_flag_name(self):
+        result = compare_versions({}, {"zeta": flag(), "alpha": flag()})
+        self.assertEqual([i["flag"] for i in result["impacts"]], ["alpha", "zeta"])
 
 
 class ImmutableVersionStorageTests(unittest.TestCase):
