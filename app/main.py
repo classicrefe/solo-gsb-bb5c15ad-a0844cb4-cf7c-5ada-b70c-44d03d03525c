@@ -12,10 +12,13 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import db as db_mod
+from .comparison import compare_configs
 from .evaluator import FlagNotFound, evaluate_flag
 from .schemas import (
     BatchEvalRequest,
     BatchEvalResponse,
+    ConfigComparisonRequest,
+    ConfigComparisonResponse,
     ConfigResponse,
     PublishConfigRequest,
     PublishResponse,
@@ -124,15 +127,7 @@ def list_configs() -> Any:
 def get_config(version: str) -> Any:
     conn = db_mod.connect()
     try:
-        row = db_mod.get_version(conn, version)
-        if row is None:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "code": "version_not_found",
-                    "message": f"config version {version!r} not found",
-                },
-            )
+        row = _require_version(conn, version)
         return ConfigResponse(**row)
     finally:
         conn.close()
@@ -143,19 +138,42 @@ def get_config(version: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _require_version(conn: Any, version: str) -> dict[str, Any]:
+    """Fetch a stored version row or raise the ``version_not_found`` envelope."""
+    row = db_mod.get_version(conn, version)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "version_not_found",
+                "message": f"config version {version!r} not found",
+            },
+        )
+    return row
+
+
+@app.post("/api/v1/config-comparisons", response_model=ConfigComparisonResponse)
+def compare_versions(body: ConfigComparisonRequest) -> Any:
+    conn = db_mod.connect()
+    try:
+        row_from = _require_version(conn, body.from_version)
+        row_to = _require_version(conn, body.to_version)
+    finally:
+        conn.close()
+
+    result = compare_configs(row_from["config"], row_to["config"])
+    return ConfigComparisonResponse(
+        from_version=body.from_version,
+        to_version=body.to_version,
+        **result.as_dict(),
+    )
+
+
 @app.post("/api/v1/evaluate", response_model=BatchEvalResponse)
 def batch_evaluate(body: BatchEvalRequest) -> Any:
     conn = db_mod.connect()
     try:
-        row = db_mod.get_version(conn, body.version)
-        if row is None:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "code": "version_not_found",
-                    "message": f"config version {body.version!r} not found",
-                },
-            )
+        row = _require_version(conn, body.version)
     finally:
         conn.close()
 
@@ -201,6 +219,7 @@ def root() -> dict[str, Any]:
             "POST /api/v1/configs",
             "GET /api/v1/configs",
             "GET /api/v1/configs/{version}",
+            "POST /api/v1/config-comparisons",
             "POST /api/v1/evaluate",
         ],
     }

@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db as db_mod  # noqa: E402
+from app.comparison import compare_configs  # noqa: E402
 from app.evaluator import evaluate_flag, hash_bucket  # noqa: E402
 from app.validation import ConfigValidationError, validate_config  # noqa: E402
 
@@ -366,6 +367,162 @@ class ImmutableVersionStorageTests(unittest.TestCase):
         versions = db_mod.list_versions(self.conn)
         self.assertEqual([v["version"] for v in versions], ["v1", "v2"])
         self.assertEqual(versions[0]["flag_count"], 1)
+
+
+class ConfigComparisonTests(unittest.TestCase):
+    def setUp(self):
+        # v1 dependency DAG (edge = prerequisite):
+        #   a -> b ; a -> c ; b -> d ; c -> d ; d -> e
+        self.v1 = {
+            "flags": {
+                "a": flag(),
+                "b": flag(prerequisites=[{"flag": "a"}]),
+                "c": flag(prerequisites=[{"flag": "a"}]),
+                "d": flag(prerequisites=[{"flag": "b"}, {"flag": "c"}]),
+                "e": flag(prerequisites=[{"flag": "d"}]),
+                "p": flag(),
+            }
+        }
+
+    def test_added_removed_modified_are_classified_and_sorted(self):
+        v2 = {
+            "flags": {
+                # unchanged
+                "b": flag(prerequisites=[{"flag": "a"}]),
+                # c removed; a and e modified
+                "a": flag(default=True),
+                "d": flag(prerequisites=[{"flag": "b"}, {"flag": "c"}]),
+                "e": flag(enabled=False),
+                # new flag that nothing depends on yet
+                "p": flag(),
+                "z": flag(),
+            }
+        }
+        result = compare_configs(self.v1, v2)
+        self.assertEqual(result.added, ["z"])
+        self.assertEqual(result.removed, ["c"])
+        self.assertEqual(result.modified, ["a", "e"])
+        self.assertEqual(list(result.impacts), ["a", "c", "e", "z"])
+
+    def test_shortest_path_wins_and_ties_are_lexicographic(self):
+        v2 = {
+            "flags": {
+                "a": flag(default=True),  # modified
+                "b": flag(prerequisites=[{"flag": "a"}]),
+                "c": flag(prerequisites=[{"flag": "a"}]),
+                "d": flag(prerequisites=[{"flag": "b"}, {"flag": "c"}]),
+                "e": flag(prerequisites=[{"flag": "d"}]),
+                "p": flag(),
+            }
+        }
+        impacted = {item["flag"]: item["path"] for item in compare_configs(self.v1, v2).impacts["a"]}
+        self.assertEqual(
+            impacted,
+            {
+                "b": ["a", "b"],
+                "c": ["a", "c"],
+                # two equal-length paths a->b->d and a->c->d: take the lexicographically smaller
+                "d": ["a", "b", "d"],
+                "e": ["a", "b", "d", "e"],
+            },
+        )
+
+    def test_indirect_impact_is_deduplicated_per_changed_flag(self):
+        v2 = {
+            "flags": {
+                "a": flag(default=True),
+                "b": flag(prerequisites=[{"flag": "a"}]),
+                "c": flag(prerequisites=[{"flag": "a"}]),
+                "d": flag(prerequisites=[{"flag": "b"}, {"flag": "c"}]),
+                "e": flag(prerequisites=[{"flag": "d"}]),
+                "p": flag(),
+            }
+        }
+        affected = [item["flag"] for item in compare_configs(self.v1, v2).impacts["a"]]
+        self.assertEqual(affected, sorted(affected))
+        self.assertEqual(len(affected), len(set(affected)))
+
+    def test_removed_flag_propagates_over_union_of_both_versions_edges(self):
+        v2 = {
+            "flags": {
+                # a is removed; b/c/d/e survive (the published v2 has its
+                # own graph, but the union must still propagate via v1 edges)
+                "b": flag(),
+                "c": flag(),
+                "d": flag(prerequisites=[{"flag": "b"}, {"flag": "c"}]),
+                "e": flag(prerequisites=[{"flag": "d"}]),
+                "p": flag(),
+            }
+        }
+        impacted = {item["flag"]: item["path"] for item in compare_configs(self.v1, v2).impacts["a"]}
+        self.assertEqual(impacted["b"], ["a", "b"])
+        self.assertEqual(impacted["e"], ["a", "b", "d", "e"])
+
+    def test_new_edge_in_to_version_is_part_of_the_union(self):
+        # 'a' is modified and gains a new dependent 'p' only present via an
+        # edge of the to-version; the union graph must still reach it.
+        v2 = {
+            "flags": {
+                "a": flag(default=True),
+                "b": flag(prerequisites=[{"flag": "a"}]),
+                "c": flag(prerequisites=[{"flag": "a"}]),
+                "d": flag(prerequisites=[{"flag": "b"}, {"flag": "c"}]),
+                "e": flag(prerequisites=[{"flag": "d"}]),
+                "p": flag(prerequisites=[{"flag": "a"}]),
+            }
+        }
+        impacted_a = {
+            item["flag"]: item["path"]
+            for item in compare_configs(self.v1, v2).impacts["a"]
+        }
+        self.assertEqual(impacted_a["p"], ["a", "p"])
+        self.assertEqual(impacted_a["d"], ["a", "b", "d"])
+
+    def test_added_and_leaf_flags_have_no_impact(self):
+        v2 = {
+            "flags": {
+                "a": flag(),
+                "b": flag(prerequisites=[{"flag": "a"}]),
+                "c": flag(prerequisites=[{"flag": "a"}]),
+                "d": flag(prerequisites=[{"flag": "b"}, {"flag": "c"}]),
+                "e": flag(prerequisites=[{"flag": "d"}]),
+                "p": flag(default=True),  # modified leaf
+                "q": flag(),  # added leaf
+            }
+        }
+        impacts = compare_configs(self.v1, v2).impacts
+        self.assertEqual(impacts["p"], [])
+        self.assertEqual(impacts["q"], [])
+
+    def test_key_reordering_is_not_a_modification(self):
+        v1 = {"flags": {"f": {"enabled": True, "default": False, "rules": []}}}
+        v2 = {"flags": {"f": {"rules": [], "default": False, "enabled": True}}}
+        result = compare_configs(v1, v2)
+        self.assertEqual(result.added, [])
+        self.assertEqual(result.removed, [])
+        self.assertEqual(result.modified, [])
+        self.assertEqual(result.impacts, {})
+
+    def test_identical_configs_have_no_changes(self):
+        result = compare_configs(self.v1, self.v1)
+        self.assertEqual(result.added, [])
+        self.assertEqual(result.removed, [])
+        self.assertEqual(result.modified, [])
+        self.assertEqual(result.impacts, {})
+
+    def test_any_definition_delta_is_modified(self):
+        v2 = {
+            "flags": {
+                "a": flag(rules=[{"conditions": [], "value": True}]),
+                "b": flag(prerequisites=[{"flag": "a"}]),
+                "c": flag(prerequisites=[{"flag": "a"}]),
+                "d": flag(prerequisites=[{"flag": "b"}, {"flag": "c"}]),
+                "e": flag(prerequisites=[{"flag": "d"}]),
+                "p": flag(),
+            }
+        }
+        result = compare_configs(self.v1, v2)
+        self.assertEqual(result.modified, ["a"])
 
 
 class EndToEndPinnedVersionTests(unittest.TestCase):

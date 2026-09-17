@@ -123,3 +123,27 @@ class BatchEvalRequest(StrictModel):
     flags: list[str] = Field(min_length=1)
     user_id: Optional[Any] = None
     attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Version comparison models
+# ---------------------------------------------------------------------------
+
+
+class ConfigComparisonRequest(StrictModel):
+    from_version: str = Field(min_length=1)
+    to_version: str = Field(min_length=1)
+
+
+class ImpactedFlag(BaseModel):
+    flag: str
+    path: list[str]
+
+
+class ConfigComparisonResponse(BaseModel):
+    from_version: str
+    to_version: str
+    added: list[str]
+    removed: list[str]
+    modified: list[str]
+    impacts: dict[str, list[ImpactedFlag]]

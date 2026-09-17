@@ -124,6 +124,52 @@ curl -s http://localhost:8000/api/v1/configs                       # 列出全�
 curl -s http://localhost:8000/api/v1/configs/2026-09-17            # 读取某版本完整配置
 ```
 
+### 6. 版本影响分析
+
+对两个**已发布**版本按开关名比较规范化定义（忽略键序等序列化差异），并沿反向前置依赖传播，
+找出每个直接变化开关会间接影响到的上游开关：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/config-comparisons \
+  -H 'Content-Type: application/json' \
+  -d '{"from_version":"2026-09-17","to_version":"2026-09-18"}'
+```
+
+```json
+{
+  "from_version": "2026-09-17",
+  "to_version": "2026-09-18",
+  "added": [],
+  "removed": ["dark_mode", "legacy_button"],
+  "modified": ["new_checkout"],
+  "impacts": {
+    "dark_mode": [],
+    "legacy_button": [],
+    "new_checkout": []
+  }
+}
+```
+
+字段说明：
+
+- `added` / `removed` / `modified`：按名称字典序排序的直接变化开关；两个版本中都存在、
+  但规范化 JSON 定义不同的开关计入 `modified`（仅键顺序不同不算变化）。
+- `impacts`：每个直接变化开关间接影响到的依赖者（即沿“前置 → 依赖它的开关”反向传播
+  可达的开关），影响目标按名称字典序排序、每个只出现一次；每项带一条从**变化开关**
+  出发到被影响开关的最短路径 `path`，同长路径取字典序最小的一条。例如 `signed_in`
+  若发生变化，依赖它的 `new_checkout` 会出现在它的影响列表中：
+  `{"flag": "new_checkout", "path": ["signed_in", "new_checkout"]}`。
+- 传播使用两个版本前置依赖边的**并集**：新版本被删除的依赖者、或新版本才出现的依赖边
+  都参与传播；叶子开关（没有任何开关依赖它）的影响列表为空数组（上例三个变化开关都
+  没有被其他开关依赖，故均为 `[]`）。
+
+任一版本不存在时返回 `404 version_not_found` 错误信封（先检查 `from_version`，再检查
+`to_version`）：
+
+```json
+{ "error": { "code": "version_not_found", "message": "config version 'nope' not found" } }
+```
+
 ### 非法配置会被拒绝
 
 ```bash
@@ -194,6 +240,7 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
 | `POST` | `/api/v1/configs` | 发布一个新版本（语义校验失败返回 422；版本重复返回 409） |
 | `GET` | `/api/v1/configs` | 列出所有版本 |
 | `GET` | `/api/v1/configs/{version}` | 获取某版本完整配置（不存在返回 404） |
+| `POST` | `/api/v1/config-comparisons` | 两个版本的影响分析：直接变化（added/removed/modified）+ 反向依赖间接影响与最短路径 |
 | `POST` | `/api/v1/evaluate` | 批量判定，请求体 `{version, flags[], user_id?, attributes?}` |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -217,7 +264,7 @@ FLAG_DB_PATH=data/flags.db uvicorn app.main:app --reload --port 8000
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、SQLite 版本不可变与历史保留、固定版本重复判定稳定性。
+测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、SQLite 版本不可变与历史保留、固定版本重复判定稳定性、版本比较的 added/removed/modified 分类、键序规范化、反向依赖最短路径（同长取字典序最小）与去重、两版本边并集传播。
 
 ## 项目结构
 
@@ -228,6 +275,7 @@ app/
   db.py          SQLite 不可变版本存储（WAL）
   validation.py  发布时语义校验（循环依赖/比例/操作符等）
   evaluator.py   纯函数判定引擎（前置、规则、稳定哈希分流）
+  comparison.py  版本影响分析（规范化定义比较 + 反向依赖 BFS 最短路径）
 tests/           标准库 unittest 测试
 examples/        发布/判定/非法配置示例
 Dockerfile, docker-compose.yml
